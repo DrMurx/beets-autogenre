@@ -58,7 +58,7 @@ class AutoGenrePlugin(BeetsPlugin):
         assert _is_plugin_enabled('lastgenre'), "The 'lastgenre' plugin is not enabled!"
         assert _is_plugin_enabled('xtractor'), "The 'xtractor' plugin is not enabled!"
         self._lastgenre = LastGenrePlugin()
-        self._xtractor = XtractorCommand(config['xtractor'])
+        self._xtractor_cmd = None
         self._remix_regex = re.compile(r'.+[^\w](remix|bootleg|remake)', re.IGNORECASE)
         self._genre_tree = None
         if self.config['auto'].get(bool):
@@ -267,19 +267,29 @@ class AutoGenrePlugin(BeetsPlugin):
             return genres, True
         return genres, False
 
+    def _xtractor(self):
+        # Created lazily since the xtractor plugin may be loaded after this one,
+        # in which case its default config is not available within __init__.
+        if not self._xtractor_cmd:
+            self._xtractor_cmd = XtractorCommand(config['xtractor'])
+        return self._xtractor_cmd
+
     def _essentia_genre(self, item):
-        if not item.get('bpm') or not item.get('genre_rosamerica'):
+        # Prefix the xtractor plugin prepends to its fields (xtractor.field_prefix).
+        # Older xtractor versions don't support it.
+        prefix = getattr(self._xtractor(), 'cfg_field_prefix', None) or ''
+        if not item.get(prefix + 'bpm') or not item.get(prefix + 'genre_rosamerica'):
             # Run essentia analysis if result not known yet.
             self._log.debug('Analyzing item using essentia: {}', item)
-            self._xtractor._run_analysis(item)
-        if 'genre_rosamerica' not in item:
+            self._xtractor()._run_analysis(item)
+        if prefix + 'genre_rosamerica' not in item:
             # Essentia analysis may not provide data in some cases.
             return []
         # Use Essentia's mapped genre_rosamerica value
-        genre_rosamerica = item.genre_rosamerica
-        genre_rosamerica_probability = float(item.genre_rosamerica_probability)
-        genre_electronic = item.genre_electronic
-        genre_electronic_probability = float(item.genre_electronic_probability)
+        genre_rosamerica = item[prefix + 'genre_rosamerica']
+        genre_rosamerica_probability = float(item[prefix + 'genre_rosamerica_probability'])
+        genre_electronic = item[prefix + 'genre_electronic']
+        genre_electronic_probability = float(item[prefix + 'genre_electronic_probability'])
         genre = ROSAMERICA_GENRES.get(genre_rosamerica)
         genres = genre and [genre] or []
         genre_electronic_strong = self.config['genre_electronic_strong'].get()

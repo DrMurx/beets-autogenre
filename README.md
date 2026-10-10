@@ -108,6 +108,8 @@ xtractor:
         - /var/lib/essentia/svm-models/beta5/timbre.history
 ```
 
+If you configure a `field_prefix` for the xtractor plugin, autogenre picks it up automatically and reads the correspondingly prefixed fields (e.g. `xtractor_genre_rosamerica`).
+
 For more information, see [CLI](#cli).
 
 ## Usage
