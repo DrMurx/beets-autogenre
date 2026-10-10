@@ -40,7 +40,7 @@ smartplaylist:
   - name: all.m3u
     query: ''
   - name: all-by-genre-album.m3u
-    query: 'genre+ albumartist+ year+ album+ disc+ track+ artist+ title+'
+    query: 'genres+ albumartist+ year+ album+ disc+ track+ artist+ title+'
 
 lastgenre:
   auto: false

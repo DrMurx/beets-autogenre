@@ -19,7 +19,7 @@ setuptools.setup(
         'Operating System :: OS Independent',
     ],
     install_requires=[
-        'beets',
+        'beets>=2.10.0',
         'pylast',
         'pyyaml',
     ]

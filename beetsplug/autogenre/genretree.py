@@ -57,3 +57,4 @@ def _tree2list(tree):
         return [x for k in tree.keys() for x in [k]+_tree2list(tree[k])]
     elif isinstance(tree, list):
         return [x for entry in tree for x in _tree2list(entry)]
+    return []

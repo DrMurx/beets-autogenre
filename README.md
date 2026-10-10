@@ -16,6 +16,9 @@ The following beets plugins and their dependencies must be installed:
 * [lastgenre plugin](https://beets.readthedocs.io/en/stable/plugins/lastgenre.html).
 * [xtractor plugin](https://github.com/adamjakab/BeetsPluginXtractor) which relies on [Essentia](https://essentia.upf.edu/).
 
+beets 2.10 or newer is required.
+The detected genres are stored within beets' `genres` list field (the primary genre first) and their origin within the `genre_source` field.
+
 ## Installation
 
 ```sh

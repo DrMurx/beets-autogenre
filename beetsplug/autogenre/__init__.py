@@ -1,20 +1,24 @@
 import codecs
-import mediafile
 import os
 import re
 import yaml
 from collections import Counter
 from beets.plugins import BeetsPlugin
 from beets.dbcore import types
-from beets.dbcore.query import FixedFieldSort
 from beets.library import Item, parse_query_parts
-from beets.ui import Subcommand, decargs
+from beets.ui import Subcommand
 from beets import config
 from optparse import OptionParser
 from confuse import ConfigSource, load_yaml
+from beetsplug import lastgenre
 from beetsplug.lastgenre import LastGenrePlugin
 from beetsplug.xtractor import XtractorCommand
 from beetsplug.autogenre.genretree import GenreTree
+
+try:
+    from beets.dbcore.sort import FixedFieldSort
+except ImportError: # beets < 2.11
+    from beets.dbcore.query import FixedFieldSort
 
 # See https://essentia.upf.edu/svm_models/accuracies_v2.1_beta1.html
 ROSAMERICA_GENRES = {
@@ -37,9 +41,9 @@ ELECTRONIC_GENRES = {
 SOURCES = set(('lastfm', 'title', 'essentia', 'user'))
 
 class AutoGenrePlugin(BeetsPlugin):
+    # The genres themselves are stored within beets' native `genres` list field.
     item_types = {
         'genre_source': types.STRING,
-        'genres': types.STRING,
     }
 
     @property
@@ -55,11 +59,8 @@ class AutoGenrePlugin(BeetsPlugin):
         assert _is_plugin_enabled('xtractor'), "The 'xtractor' plugin is not enabled!"
         self._lastgenre = LastGenrePlugin()
         self._xtractor = XtractorCommand(config['xtractor'])
-        self._lastgenre_conf = config['lastgenre'].get() or {}
-        self._separator = self._lastgenre_conf.get('separator') or ', '
         self._remix_regex = re.compile(r'.+[^\w](remix|bootleg|remake)', re.IGNORECASE)
         self._genre_tree = None
-        # TODO: fix auto support - fix genres field mapping, see https://github.com/beetbox/mediafile/blob/master/mediafile.py#L1814
         if self.config['auto'].get(bool):
             self.import_stages = [self.imported]
 
@@ -74,24 +75,25 @@ class AutoGenrePlugin(BeetsPlugin):
             self._update_item_genre(task.item)
 
     def _update_item_genre(self, item):
-        genre, genres, source = self._item_genre(item, True, True)
-        self._log.info("Set track genre '{}' ({}): {}", genre, source, item)
-        item.genre = genre
+        genres, source = self._item_genre(item, True, True)
+        self._log.info("Set track genres '{}' ({}): {}", _genres2str(genres), source, item)
         item.genres = genres
         item.genre_source = source
         if not self.config['pretend'].get():
             if config['import']['write'].get():
                 item.try_write()
-            item.store(['genre'])
-            item.store(['genres', 'genre_source'])
+            item.store()
 
     def _update_album_genre(self, album):
-        genre = _most_common([item.genre for item in album.items()])
-        if album.genre != genre and genre:
-            album.genre = genre
-            self._log.info("Set genre '{}' for album {}", album.genre, album)
+        item_genres = [tuple(item.genres) for item in album.items() if item.genres]
+        genre = _most_common([genres[0] for genres in item_genres])
+        genres = list(_most_common([g for g in item_genres if g[0] == genre]) or [])
+        if list(album.genres) != genres and genres:
+            album.genres = genres
+            self._log.info("Set genres '{}' for album {}", _genres2str(genres), album)
             if not self.config['pretend'].get():
-                album.store(['genre'])
+                # Don't overwrite the genres of the album's tracks.
+                album.store(['genres'], inherit=False)
 
     def commands(self):
         p = OptionParser()
@@ -144,8 +146,7 @@ class AutoGenrePlugin(BeetsPlugin):
             ok = self._genres().contains(opts.genre)
             assert args, "Must specify selector when --genre provided"
             assert ok, "Provided genre '{}' is not registered within genre tree!".format(opts.genre)
-        query = decargs(args)
-        parsed_query, parsed_sort = parse_query_parts(query, Item)
+        parsed_query, parsed_sort = parse_query_parts(args, Item)
         parsed_sort = FixedFieldSort("albumartist", ascending=True)
         items = lib.items(parsed_query, parsed_sort)
         all = opts.all or opts.genre is not None
@@ -155,16 +156,15 @@ class AutoGenrePlugin(BeetsPlugin):
         self._log.info('Selected {} items for genre update...', len(filtered_items))
         # Update items
         for item in filtered_items:
-            genre, genres, source = self._item_genre(item, all, force, opts.genre)
-            genre_changed = genre != item.get('genre')
-            genres_changed = genres != item.get('genres')
+            genres, source = self._item_genre(item, all, force, opts.genre)
+            old_genres = list(item.get('genres') or [])
+            genres_changed = genres != old_genres
             genre_source_changed = source != item.get('genre_source')
-            changed = genre_changed or genres_changed or genre_source_changed
-            if changed and genres is not None:
-                msg = "Change genre from '{}' to '{}' ({}) for item: {}"
-                self._log.info(msg, item.get('genre'), genre, source, item)
+            changed = genres_changed or genre_source_changed
+            if changed and genres:
+                msg = "Change genres from '{}' to '{}' ({}) for item: {}"
+                self._log.info(msg, _genres2str(old_genres), _genres2str(genres), source, item)
                 if not pretend:
-                    item.genre = genre
                     item.genres = genres
                     item.genre_source = source
                     if config['import']['write'].get():
@@ -184,51 +184,59 @@ class AutoGenrePlugin(BeetsPlugin):
                 self.config[k] = v
 
     def _item_genre(self, item, all, force, force_genre=None):
+        '''Returns the item's genre list (primary genre first) and its source.'''
         genres, source = self._item_genres(item, all, force, force_genre)
-        genrel = self._str2list(genres)
-        genre = genres and genrel[0] or None
+        genres = _unique([g for g in genres if g])
 
-        if genres:
-            if self.config['parent_genres'].get() and genre:
-                # Append primary genre's parent genres to genre list
-                parent_genres = self._genres().parents(genre)
-                parent_genres = [self._format_genre(g) for g in parent_genres]
-                genrel = genrel + [g for g in parent_genres if g not in genrel]
-                genres = self._list2str(genrel)
+        if genres and self.config['parent_genres'].get():
+            # Append primary genre's parent genres to genre list
+            parent_genres = self._genres().parents(genres[0])
+            parent_genres = [self._format_genre(g) for g in parent_genres]
+            genres = _unique(genres + parent_genres)
 
-        return genre, genres, source
+        return genres, source
 
     def _item_genres(self, item, all, force, force_genre):
-        genre = item.get('genres')
-        if not genre:
-            genre = item.get('genre')
+        genres = list(item.get('genres') or [])
         source = item.get('genre_source')
         if _filter_item(item, all, force):
             if force_genre is not None:
                 source = force_genre and 'user' or None
-                genre = self._format_genre(force_genre.lower())
-            if source != 'user' or not genre:
+                genres = force_genre and [self._format_genre(force_genre.lower())] or []
+            if source != 'user' or not genres:
                 # auto-detect genre
                 if self.config['lastgenre'].get():
-                    genre = self._lastfm_genre(item)
-                    if genre is not None:
+                    genres = self._lastfm_genre(item)
+                    if genres:
                         source = 'lastfm'
                 if self.config['from_title'].get():
-                    genre, matched = self._fix_remix_genre(item, genre)
-                    if matched and genre is not None:
+                    genres, matched = self._fix_remix_genre(item, genres)
+                    if matched and genres:
                         source = 'title'
-                if genre is None and self.config['xtractor'].get():
-                    genre = self._essentia_genre(item)
-                    if genre is not None:
+                if not genres and self.config['xtractor'].get():
+                    genres = self._essentia_genre(item)
+                    if genres:
                         source = 'essentia'
-        return genre, source
+        return genres, source
 
     def _is_remix(self, title):
         return self._remix_regex.match(title) is not None
 
     def _lastfm_genre(self, item):
-        genre = None
-        src = None
+        # lastgenre keeps the existing genres unless its force option is enabled.
+        # Hide them since the item was selected to get its genres reevaluated.
+        existing_genres = item.genres
+        item.genres = []
+        try:
+            genres, src = self._lastfm_genre_lookup(item)
+        finally:
+            item.genres = existing_genres
+        if genres:
+            msg = "Got last.fm genres '{}' based on {} for item: {}"
+            self._log.debug(msg, _genres2str(genres), src, item)
+        return list(genres or [])
+
+    def _lastfm_genre_lookup(self, item):
         source = self._lastgenre.config['source'].get()
         if self._is_remix(item.get('title')) and source != 'track':
             # When item is remix, get genre frpm the last.fm track.
@@ -237,38 +245,27 @@ class AutoGenrePlugin(BeetsPlugin):
             # For other items the album/artist source is more reliable.)
             self._lastgenre.config['source'] = 'track'
             try:
-                genre, src = self._lastgenre._get_genre(item)
+                return self._lastgenre._get_genre(item)
             finally:
                 self._lastgenre.config['source'].set(source)
-        else:
-            genre, src = self._lastgenre._get_genre(item)
-        if genre:
-            msg = "Got last.fm genre '{}' based on {} for item: {}"
-            self._log.debug(msg, genre, src, item)
-        return genre
+        return self._lastgenre._get_genre(item)
 
-    def _fix_remix_genre(self, item, genre):
+    def _fix_remix_genre(self, item, genres):
         '''Match genre within title or album and prepend to genre list.
         This fixes remixes that are wrongly tagged on last.fm'''
         title = item.get('title')
         album = item.get('album')
-        genres = self._str2list(genre)
         matched = self._genres().match(title)
         if matched:
             source = 'title'
         elif album:
             source = 'album'
             matched = self._genres().match(album)
-        prepend_genre = None
         if matched:
-            prepend_genre = matched.lower()
-        if prepend_genre:
-            prepend_genre = self._format_genre(prepend_genre)
-            genres = [g for g in genres if g != prepend_genre]
-            genre = self._list2str([prepend_genre] + genres)
-            self._log.debug("Fixed genre '{}' based on {} of item: {}", genre, source, item)
-            return genre, True
-        return genre, False
+            genres = _unique([self._format_genre(matched.lower())] + genres)
+            self._log.debug("Fixed genres '{}' based on {} of item: {}", _genres2str(genres), source, item)
+            return genres, True
+        return genres, False
 
     def _essentia_genre(self, item):
         if not item.get('bpm') or not item.get('genre_rosamerica'):
@@ -277,13 +274,14 @@ class AutoGenrePlugin(BeetsPlugin):
             self._xtractor._run_analysis(item)
         if 'genre_rosamerica' not in item:
             # Essentia analysis may not provide data in some cases.
-            return None
+            return []
         # Use Essentia's mapped genre_rosamerica value
         genre_rosamerica = item.genre_rosamerica
         genre_rosamerica_probability = float(item.genre_rosamerica_probability)
         genre_electronic = item.genre_electronic
         genre_electronic_probability = float(item.genre_electronic_probability)
         genre = ROSAMERICA_GENRES.get(genre_rosamerica)
+        genres = genre and [genre] or []
         genre_electronic_strong = self.config['genre_electronic_strong'].get()
         genre_rosamerica_strong = self.config['genre_rosamerica_strong'].get()
         genre_electronic_prepend = self.config['genre_electronic_prepend'].get()
@@ -293,55 +291,48 @@ class AutoGenrePlugin(BeetsPlugin):
             if genre_electronic_probability > genre_electronic_strong:
                 # Use the result of Essentia's electronic genre model
                 genre = ELECTRONIC_GENRES.get(genre_electronic)
+                genres = genre and [genre] or []
         elif genre_rosamerica_probability < genre_rosamerica_strong and genre_electronic_probability > genre_electronic_prepend:
             # Prepend electronic to genre list
-            genres = ['electronic'] + [genre]
+            genres = ['electronic'] + genres
             genre_electro = ELECTRONIC_GENRES.get(genre_electronic)
             if genre_electro: # Append electronic sub genre to list
                 genres += [genre_electro]
-            genre = self._list2str(genres)
 
         if genre_electronic_probability > genre_electronic_append:
             if genre_rosamerica in ('rhy', 'pop', 'hip'):
                 # Append electronic to genre list
-                genres = self._str2list(genre)
                 if 'electronic' not in genres:
-                    genre = self._list2str(genres + ['electronic'])
+                    genres = genres + ['electronic']
             elif genre == 'dance':
-                genre = 'electronic'
+                genres = ['electronic']
 
-        genre = self._format_genre(genre)
-        self._log.debug("Got essentia genre '{}' for item: {}", genre, item)
-        return genre
+        genres = [self._format_genre(g) for g in genres]
+        self._log.debug("Got essentia genres '{}' for item: {}", _genres2str(genres), item)
+        return genres
 
     def _genres(self):
         if not self._genre_tree:
-            genre_tree_file = self._lastgenre_conf.get('canonical')
-            if not genre_tree_file:
-                genre_tree_file = os.path.join(os.path.dirname(__file__), '..', 'lastgenre', 'genres-tree.yaml')
-            genre_wh_file = self._lastgenre_conf.get('whitelist')
-            assert genre_wh_file, "Config option lastgenre.whitelist is not specified!"
-            with open(genre_wh_file, 'r') as f:
-                genre_whitelist = [genre.strip().lower() for genre in f.readlines() if genre.strip()]
-            with codecs.open(genre_tree_file, 'r', encoding='utf-8') as f:
+            genre_tree_file = self._lastgenre.config['canonical'].get()
+            if not isinstance(genre_tree_file, str) or not genre_tree_file:
+                # Use the genre tree that is shipped with the lastgenre plugin.
+                genre_tree_file = os.path.join(os.path.dirname(lastgenre.__file__), 'genres-tree.yaml')
+            genre_whitelist = self._lastgenre.whitelist
+            assert genre_whitelist, "Config option lastgenre.whitelist is disabled!"
+            with codecs.open(os.path.expanduser(genre_tree_file), 'r', encoding='utf-8') as f:
                 genre_tree_yaml = yaml.safe_load(f)
             self._genre_tree = GenreTree(genre_tree_yaml, genre_whitelist)
 
         return self._genre_tree
 
     def _format_genre(self, genre):
-        return self._lastgenre._format_tag(genre)
-
-    def _str2list(self, str):
-        return str and str.split(self._separator) or []
-
-    def _list2str(self, list):
-        return self._separator.join(list)
+        # Corresponds to the formatting the lastgenre plugin applies.
+        return genre.title() if self._lastgenre.config['title_case'].get() else genre
 
 
 def _filter_item(item, all, force):
     src = item.get('genre_source')
-    empty = not item.get('genre')
+    empty = not item.get('genres')
     return (empty or src in SOURCES or not src and all) and (empty or force)
 
 def _is_plugin_enabled(plugin_name):
@@ -352,3 +343,13 @@ def _most_common(names):
     r = Counter([name for name in names if name]).most_common(1)
     if len(r) == 1:
         return r[0][0]
+
+def _unique(genres):
+    '''Removes duplicate genres case-insensitively, preserving the order.'''
+    r = {}
+    for genre in genres:
+        r.setdefault(genre.lower(), genre)
+    return list(r.values())
+
+def _genres2str(genres):
+    return ', '.join(genres or [])
